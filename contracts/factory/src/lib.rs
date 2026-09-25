@@ -171,6 +171,38 @@ impl Factory {
     /// (or the CL equivalents), which have always been bounded.
     pub const MAX_UNBOUNDED_PAGE: u32 = 200;
 
+    /// Instance-TTL threshold and bump, in ledgers.
+    ///
+    /// The factory's instance entry holds the executable plus every
+    /// `storage().instance()` value: admin, WASM hashes, pool counts, fee
+    /// config, treasury and mode flags. If that entry is archived the factory
+    /// stops responding — integrators can no longer enumerate or look up pools
+    /// and no new pool can be deployed until it is restored. The factory is the
+    /// only deployable contract in the workspace that previously managed no TTL
+    /// at all (issue #904), so every entrypoint now extends it.
+    ///
+    /// At the ~5s/ledger Stellar cadence:
+    /// - `MIN_TTL` = 120_960 ledgers ≈ 7 days: only rewrite the entry when less
+    ///   than a week of life remains, keeping hot paths cheap.
+    /// - `BUMP_TO` = 2_419_200 ledgers ≈ 140 days: renew toward the persistent
+    ///   rent window, so one call keeps the factory live for months.
+    ///
+    /// The same constants extend the per-pool persistent registry entries
+    /// (`Pool`, `LpToken`, `PoolByIndex`, ...) on the paths that write them, so
+    /// the registry ages together with the instance entry rather than lapsing
+    /// independently.
+    pub const MIN_TTL: u32 = 120_960;
+    pub const BUMP_TO: u32 = 2_419_200;
+
+    /// Extend the contract's instance storage TTL. Called as the first statement
+    /// of every public entrypoint, including read-only paths, because a pure
+    /// lookup is often the only traffic the factory sees for long stretches.
+    fn extend_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(Self::MIN_TTL, Self::BUMP_TO);
+    }
+
     // ── Setup ─────────────────────────────────────────────────────────────────
 
     /// One-time factory setup.
@@ -183,6 +215,7 @@ impl Factory {
         amm_wasm_hash: BytesN<32>,
         token_wasm_hash: BytesN<32>,
     ) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(FactoryError::AlreadyInitialized);
         }
@@ -229,6 +262,7 @@ impl Factory {
         fee_tier: i128,
         governance_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(Address, Option<Address>), FactoryError> {
+        Self::extend_ttl(&env);
         Self::ensure_creation_unpaused(&env)?;
         let fee_bps = fee_tier_to_bps(fee_tier)?;
         Self::create_pool_with_fee_bps(env, caller, token_a, token_b, fee_bps, governance_wasm_hash)
@@ -252,6 +286,7 @@ impl Factory {
         fee_bps: i128,
         governance_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(Address, Option<Address>), FactoryError> {
+        Self::extend_ttl(&env);
         Self::ensure_creation_unpaused(&env)?;
 
         // ── Validate BEFORE charging (issue #520) ─────────────────────────
@@ -392,6 +427,21 @@ impl Factory {
             .persistent()
             .set(&DataKey::PoolByIndex(n), &pool_addr);
 
+        // Bump the per-pool registry entries on the same call path that writes
+        // them, so the registry does not lapse independently of the instance
+        // entry (issue #904).
+        for key in [
+            DataKey::Pool(ta.clone(), tb.clone()),
+            DataKey::LpToken(pool_addr.clone()),
+            DataKey::GovernanceFor(pool_addr.clone()),
+            DataKey::PoolTokens(pool_addr.clone()),
+            DataKey::PoolByIndex(n),
+        ] {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
+        }
+
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "pool_created"),),
@@ -421,6 +471,7 @@ impl Factory {
         amm_wasm_hash: Option<BytesN<32>>,
         token_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if let Some(ref h) = amm_wasm_hash {
@@ -443,6 +494,7 @@ impl Factory {
     /// Existing pools are unaffected; only pools created after this call
     /// will use the new default tier.
     pub fn set_default_fee_tier(env: Env, fee_tier: i128) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -464,6 +516,7 @@ impl Factory {
     /// The new WASM must already be uploaded to the network.
     /// State is preserved; only bytecode is replaced.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.deployer()
@@ -475,6 +528,7 @@ impl Factory {
 
     /// Set or update the WASM hash used for concentrated_liquidity deployments. Admin-only.
     pub fn set_cl_wasm_hash(env: Env, cl_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
@@ -485,6 +539,7 @@ impl Factory {
 
     /// Pause all new V2 and concentrated-liquidity pool creation. Admin-only.
     pub fn pause_creation(env: Env, admin: Address) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
@@ -499,6 +554,7 @@ impl Factory {
 
     /// Resume V2 and concentrated-liquidity pool creation. Admin-only.
     pub fn unpause_creation(env: Env, admin: Address) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
@@ -533,6 +589,7 @@ impl Factory {
         fee_bps: i128,
         initial_tick: i32,
     ) -> Result<Address, FactoryError> {
+        Self::extend_ttl(&env);
         Self::ensure_creation_unpaused(&env)?;
 
         // ── Validate BEFORE charging (issue #520) ─────────────────────────
@@ -621,6 +678,17 @@ impl Factory {
             .persistent()
             .set(&DataKey::ClPoolByIndex(n), &pool_addr);
 
+        // Bump the CL registry entries on the same call path that writes them
+        // (issue #904).
+        env.storage()
+            .persistent()
+            .extend_ttl(&cl_key, Self::MIN_TTL, Self::BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ClPoolByIndex(n),
+            Self::MIN_TTL,
+            Self::BUMP_TO,
+        );
+
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "cl_pool_created"),),
@@ -641,6 +709,7 @@ impl Factory {
     /// The pool creation fee and fee token must be set via `set_pool_creation_fee`
     /// before enabling permissionless mode.
     pub fn set_permissionless_mode(env: Env, enabled: bool) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
@@ -664,6 +733,7 @@ impl Factory {
         fee_token: Address,
         fee_amount: i128,
     ) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if fee_amount <= 0 {
@@ -686,6 +756,7 @@ impl Factory {
     /// Defaults to 1 (one pool per ledger per address). Increase to slow down
     /// burst creation attempts. Set to 0 to disable rate limiting.
     pub fn set_rate_limit(env: Env, min_ledgers: u32) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
@@ -698,6 +769,7 @@ impl Factory {
 
     /// Return whether permissionless pool creation is currently enabled.
     pub fn is_permissionless(env: Env) -> bool {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PermissionlessMode)
@@ -706,11 +778,13 @@ impl Factory {
 
     /// Return whether new V2 and CL pool creation is currently paused.
     pub fn is_creation_paused(env: Env) -> bool {
+        Self::extend_ttl(&env);
         Self::creation_paused(&env)
     }
 
     /// Return the current pool creation fee `(fee_token, fee_amount)`, or `None` if unset.
     pub fn get_pool_creation_fee(env: Env) -> Option<(Address, i128)> {
+        Self::extend_ttl(&env);
         let token: Option<Address> = env.storage().instance().get(&DataKey::FeeToken);
         let amount: Option<i128> = env.storage().instance().get(&DataKey::PoolCreationFee);
         match (token, amount) {
@@ -721,11 +795,13 @@ impl Factory {
 
     /// Return the LP token address for the given pool, or `None` if unknown.
     pub fn get_lp_token(env: Env, pool: Address) -> Option<Address> {
+        Self::extend_ttl(&env);
         env.storage().persistent().get(&DataKey::LpToken(pool))
     }
 
     /// Return the governance address for the given pool, or `None` if unknown.
     pub fn get_governance(env: Env, pool: Address) -> Option<Address> {
+        Self::extend_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::GovernanceFor(pool))
@@ -737,6 +813,7 @@ impl Factory {
     /// Returns the fee tier ID (0-3) that will be used for new pools
     /// if no specific tier is provided to `create_pool`.
     pub fn get_default_fee_tier(env: Env) -> i128 {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::DefaultFeeTier)
@@ -750,13 +827,15 @@ impl Factory {
     /// - 1 → 5 bps (0.05%)
     /// - 2 → 30 bps (0.3%)
     /// - 3 → 100 bps (1.0%)
-    pub fn get_fee_tier_bps(_env: Env, fee_tier: i128) -> Result<i128, FactoryError> {
+    pub fn get_fee_tier_bps(env: Env, fee_tier: i128) -> Result<i128, FactoryError> {
+        Self::extend_ttl(&env);
         fee_tier_to_bps(fee_tier)
     }
 
     /// Return the pool address for `(token_a, token_b)`, or `None` if it does
     /// not exist. Token pair order does not matter.
     pub fn get_pool(env: Env, token_a: Address, token_b: Address) -> Option<Address> {
+        Self::extend_ttl(&env);
         let (ta, tb) = if token_a < token_b {
             (token_a, token_b)
         } else {
@@ -773,6 +852,7 @@ impl Factory {
         token_b: Address,
         fee_bps: i128,
     ) -> Option<Address> {
+        Self::extend_ttl(&env);
         let (ta, tb) = if token_a < token_b {
             (token_a, token_b)
         } else {
@@ -804,6 +884,7 @@ impl Factory {
     /// Return the total number of **AMM** pools deployed by this factory.
     /// See `get_cl_pool_count()` for the CL pool count.
     pub fn get_pool_count(env: Env) -> u64 {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PoolCount)
@@ -813,6 +894,7 @@ impl Factory {
     /// Return up to `limit` **AMM** pool addresses starting at `offset`.
     /// See `get_cl_pools()` for CL pool pagination.
     pub fn get_pools(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        Self::extend_ttl(&env);
         let count: u64 = env
             .storage()
             .instance()
@@ -841,6 +923,7 @@ impl Factory {
 
     /// Return the total number of CL pools deployed by this factory.
     pub fn get_cl_pool_count(env: Env) -> u64 {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::ClPoolCount)
@@ -849,6 +932,7 @@ impl Factory {
 
     /// Return up to `limit` CL pool addresses starting at `offset`.
     pub fn get_cl_pools(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        Self::extend_ttl(&env);
         let count: u64 = env
             .storage()
             .instance()
@@ -868,6 +952,7 @@ impl Factory {
 
     /// Check if an address is a registered CL pool in this factory.
     pub fn is_cl_pool(env: Env, pool: Address) -> bool {
+        Self::extend_ttl(&env);
         let count: u64 = env
             .storage()
             .instance()
@@ -903,6 +988,7 @@ impl Factory {
         treasury: Address,
         global_protocol_fee_bps: i128,
     ) -> Result<(), FactoryError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(FactoryError::Unauthorized);
@@ -934,6 +1020,7 @@ impl Factory {
     ///
     /// Returns `None` when no treasury has been configured yet.
     pub fn get_treasury(env: Env) -> Option<(Address, i128)> {
+        Self::extend_ttl(&env);
         let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
         let bps: i128 = env
             .storage()
@@ -945,6 +1032,7 @@ impl Factory {
 
     /// Return the token pair `(token_a, token_b)` recorded for `pool`, or `None`.
     pub fn get_pool_tokens(env: Env, pool: Address) -> Option<(Address, Address)> {
+        Self::extend_ttl(&env);
         env.storage().persistent().get(&DataKey::PoolTokens(pool))
     }
 
@@ -965,6 +1053,7 @@ impl Factory {
         admin: Address,
         protocol_fee_bps: i128,
     ) -> Result<u32, FactoryError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(FactoryError::Unauthorized);
@@ -997,6 +1086,7 @@ impl Factory {
         offset: u32,
         limit: u32,
     ) -> Result<u32, FactoryError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(FactoryError::Unauthorized);
@@ -1037,6 +1127,7 @@ impl Factory {
     /// - `set_treasury` must have been called to configure the treasury and sync
     ///   the factory as the `fee_recipient` on the target pools.
     pub fn sweep_fees(env: Env, token: Address) -> Result<i128, FactoryError> {
+        Self::extend_ttl(&env);
         let (_, total_collected) = Self::sweep_fees_page(&env, &token, 0, Self::pool_count(&env))?;
         Ok(total_collected)
     }
@@ -1048,6 +1139,7 @@ impl Factory {
         offset: u32,
         limit: u32,
     ) -> Result<(u32, i128), FactoryError> {
+        Self::extend_ttl(&env);
         Self::sweep_fees_page(&env, &token, offset, limit)
     }
 
@@ -1357,7 +1449,7 @@ impl Factory {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{storage::Instance as _, Address as _, Ledger},
         Env, IntoVal,
     };
 
@@ -2955,5 +3047,81 @@ mod tests {
         assert_eq!(all, expected);
         assert_eq!(all, factory.get_pools(&0, &(total as u32)));
         assert_eq!(factory.all_pools(), factory.get_pools(&0, &u32::MAX));
+    }
+
+    // ── Instance TTL regression (issue #904) ────────────────────────────────
+    // The factory previously managed no TTL at all. Its instance entry holds
+    // the admin, WASM hashes, pool counts, fee config and treasury; if it is
+    // archived the pool registry becomes unreachable and no new pool can be
+    // deployed. These tests initialise a factory with placeholder WASM hashes
+    // (no pool is created, so no real WASM is needed), drive the ledger past
+    // the instance TTL, then confirm entrypoints still respond and re-extend it.
+
+    fn ttl_env_and_factory() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let amm_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let token_hash = BytesN::from_array(&env, &[2u8; 32]);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        (env, factory_addr)
+    }
+
+    fn instance_ttl(env: &Env, factory_addr: &Address) -> u32 {
+        env.as_contract(factory_addr, || env.storage().instance().get_ttl())
+    }
+
+    fn lower_instance_ttl_below_min(env: &Env, factory_addr: &Address) {
+        env.ledger()
+            .with_mut(|l| l.sequence_number += Factory::BUMP_TO - Factory::MIN_TTL + 1);
+        let ttl = instance_ttl(env, factory_addr);
+        assert!(
+            ttl < Factory::MIN_TTL,
+            "test setup should lower instance TTL below MIN_TTL, got {ttl}"
+        );
+    }
+
+    fn assert_instance_ttl_bumped(env: &Env, factory_addr: &Address) {
+        let ttl = instance_ttl(env, factory_addr);
+        assert!(
+            ttl >= Factory::BUMP_TO - 1,
+            "instance TTL {ttl} should be bumped toward BUMP_TO"
+        );
+    }
+
+    #[test]
+    fn test_initialize_extends_instance_ttl() {
+        let (env, factory_addr) = ttl_env_and_factory();
+        assert_instance_ttl_bumped(&env, &factory_addr);
+    }
+
+    #[test]
+    fn test_read_entrypoint_restores_lapsed_instance_ttl() {
+        let (env, factory_addr) = ttl_env_and_factory();
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        lower_instance_ttl_below_min(&env, &factory_addr);
+
+        // A pure registry lookup is often the only traffic the factory sees for
+        // long stretches; it must still respond and restore the instance TTL.
+        assert_eq!(factory.get_pool_count(), 0);
+        assert_instance_ttl_bumped(&env, &factory_addr);
+    }
+
+    #[test]
+    fn test_write_entrypoint_restores_lapsed_instance_ttl() {
+        let (env, factory_addr) = ttl_env_and_factory();
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        lower_instance_ttl_below_min(&env, &factory_addr);
+
+        // `set_default_fee_tier` writes only instance state, isolating the
+        // write-path TTL bump from the per-pool persistent registry entries.
+        factory.set_default_fee_tier(&1i128);
+
+        assert_eq!(factory.get_default_fee_tier(), 1);
+        assert_instance_ttl_bumped(&env, &factory_addr);
     }
 }
