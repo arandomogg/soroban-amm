@@ -10,7 +10,6 @@ Soroban AMM contracts across all contract crates in `contracts/`. For each code 
 - **Remedy** – actionable instructions for the caller to recover.
 
 Use the numeric code when parsing RPC responses or writing off-chain tooling.
-=======
 ## Factory
 
 | Code | Name | Description |
@@ -44,6 +43,9 @@ Defined in [contracts/oracle_aggregator/src/lib.rs](../contracts/oracle_aggregat
 | 8 | `InvalidDeviation` | `max_deviation_bps` was zero or exceeded `BPS_DENOMINATOR` (10 000). | Use a value in `1..=10_000`. |
 | 9 | `InvalidWeight` | A source weight was zero or exceeded `MAX_SOURCE_WEIGHT` (100 000). | Use a value in `1..=100_000`. |
 | 10 | `WeightFloorNotMet` | The total agreeing weight was below `MIN_AGREEING_WEIGHT` (20 000). | Increase individual source weights or register more sources. |
+| 11 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
+| 12 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 13 | `Paused` | The aggregator has been paused. | Wait for the admin to call `unpause`. |
 
 > **ABI change (#689):** `AggregatedPrice.confidence` is now the **summed weight**
 > of agreeing sources (not a raw count). A source with weight 10 000 contributes
@@ -77,6 +79,7 @@ Defined in [contracts/amm/src/lib.rs](../contracts/amm/src/lib.rs) as `AmmError`
 | 18 | `FlashLoanRepaymentFailed` | Receiver contract failed to return borrowed tokens plus fee (`balance_after < balance_before + fee`). | Ensure `on_flash_loan` callback repays principal and fee in full. |
 | 19 | `AlreadyExecuted` | Emergency withdrawal multisig proposal was already executed (`proposal.executed == true`). | No action required; proposal has already been executed. |
 | 20 | `ProposalExpired` | Emergency withdrawal multisig proposal exceeded its validity window (`now > proposal.expires_at`). | Submit a new emergency withdrawal proposal. |
+| 21 | `NotInitialized` | A function that reads pool configuration (tokens, LP token, admin, fee settings) was called before `initialize`. Covers admin setters, liquidity, swaps, quotes, and the `get_info` / `get_fee_info` / `shares_of` views. | Call `initialize` first. |
 
 ---
 
@@ -106,6 +109,7 @@ Defined in [contracts/amm-sdk/src/types.rs](../contracts/amm-sdk/src/types.rs) a
 | 18 | `FlashLoanRepaymentFailed` | Receiver did not repay borrowed amounts + fees. | Ensure `on_flash_loan` repays in full. |
 | 19 | `AlreadyExecuted` | Multisig emergency withdrawal was already executed. | No action — proposal already carried out. |
 | 20 | `ProposalExpired` | Multisig emergency withdrawal proposal has expired. | Submit a new proposal. |
+| 21 | `NotInitialized` | Pool configuration was read before `initialize`. | Call `initialize` first. |
 
 ---
 
@@ -196,6 +200,7 @@ Defined in [contracts/concentrated_liquidity/src/lib.rs](../contracts/concentrat
 | 21 | `NftContractChangeBlocked` | Admin attempted NFT contract change while tokenized positions exist. | Untokenize/burn active position NFTs before changing contract. |
 | 22 | `RangeOrderExists` | Range order already active on specified range for caller. | Withdraw existing range order before placing a new one. |
 | 23 | `ExactOutNotFullyFilled` | `swap_exact_out` or `quote_exact_out` (#696) could not fill the requested `amount_out` in full before running out of initialized ticks or hitting `sqrt_price_limit_x96`. Exact-out has no meaningful partial fill. | Reduce `amount_out`, widen `sqrt_price_limit_x96`, or add liquidity to the range being traded against. |
+| 24 | `NotInitialized` | A function that depends on pool state (tokens, admin, current tick) was called before `initialize`. This covers the admin setters, every liquidity/swap/quote entrypoint, and the `current_tick`, `get_tokens`, and `fee_bps` views. | Call `initialize` first. |
 
 `swap_exact_out(env, sender, zero_for_one, amount_out, sqrt_price_limit_x96,
 max_amount_in, deadline)` (#696) is the mirror of `swap`: it fixes the
@@ -219,6 +224,9 @@ Defined in [contracts/dex_aggregator/src/lib.rs](../contracts/dex_aggregator/src
 | 3 | `UnregisteredPool` | A route hop references a pool that is not registered with the factory. | Only route through pools registered via the factory. |
 | 4 | `InvalidMaxHops` | `set_max_hops` called with `0`. | Pass a positive hop count. |
 | 5 | `TooManyRoutingTokens` | `set_routing_tokens` called with more than `MAX_ROUTING_TOKENS` addresses. | Reduce the routing token list size. |
+| 6 | `NotInitialized` | An admin setter, quote, swap, or `pause`/`unpause` entrypoint was called before `initialize` (admin/factory unset). | Call `initialize` first. |
+| 7 | `Paused` | A state-mutating entrypoint (`set_max_hops`, `register_cl_pool`, `set_routing_tokens`, `remove_cl_pool`, `execute_route`, `swap_best`) was called while the aggregator is paused. Quotes (`find_best_route`, `get_quote`, `is_price_within_tolerance`) stay callable. | Wait for the admin to call `unpause`; check `is_paused` first. |
+| 8 | `Unauthorized` | `pause` or `unpause` was called with an `admin` address that does not match the stored admin. | Pass the stored admin address and sign with its key. |
 
 ---
 
@@ -264,6 +272,9 @@ Defined in [contracts/factory/src/lib.rs](../contracts/factory/src/lib.rs) as `F
 | 7 | `FeeNotConfigured` | Attempted pool creation with unconfigured or invalid fee tier. | Use a configured fee tier (e.g., 1, 5, 30, 100 bps). |
 | 8 | `RateLimitExceeded` | Pool creation rate limit reached for current epoch. | Wait for rate limit window to reset. |
 | 9 | `CreationPaused` | Admin administratively paused pool creation. | Wait for admin to unpause creation. |
+| 10 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
+| 11 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 12 | `NotInitialized` | A function that reads factory configuration (admin, AMM/LP WASM hashes) was called before `initialize`. Covers pool creation (`create_pool`, `create_pool_with_fee_bps`, `create_cl_pool`) and every admin entrypoint. Code 2 is `InvalidFeeBps`, so this code is appended. | Call `initialize` first. |
 
 ---
 
@@ -336,15 +347,37 @@ Defined in [contracts/governance/src/lib.rs](../contracts/governance/src/lib.rs)
 | 32 | `VetoMultisigNotSet` | Veto-related operation called when no veto multisig is configured. | Configure the veto multisig during governance initialization. |
 | 33 | `NoPendingAdmin` | `accept_admin` called without a prior `propose_admin`. | Call `propose_admin` first to nominate a successor. |
 | 34 | `PartialFactoryUpdate` | `UpdateFactoryGlobalFee` proposal window (`offset`/`limit`) does not cover all factory pools. | Submit proposal covering all registered factory pools. |
+| 35 | `NotInitialized` | A function that reads governance configuration (admin, AMM pool, LP token, voting period, timelock, quorum, proposer stake, proposal counter) was called before `initialize`. Covers the admin setters, `propose_admin`, `propose`, `get_params`, and any proposal path that reaches that configuration. Code 2 is `InvalidVotingPeriod`, so this code is appended. | Call `initialize` first. |
 
 ---
 
 ## IncentiveCampaigns (`contracts/incentive_campaigns`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/incentive_campaigns/src/lib.rs](../contracts/incentive_campaigns/src/lib.rs)).
+Defined in [contracts/incentive_campaigns/src/lib.rs](../contracts/incentive_campaigns/src/lib.rs) as `IncentiveError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called on a contract that already has governance set. | Initialize once upon deployment. |
+| 2 | `NotInitialized` | A function was called before `initialize` (governance / id counters unset). | Call `initialize` first. |
+| 3 | `Unauthorized` | A governance-only function was called by another address. | Call using the governance address. |
+| 4 | `NoPendingGovernance` | `accept_governance` was called with no nomination outstanding. | Have governance call `propose_governance` first. |
+| 5 | `NotPendingGovernance` | `accept_governance` was called by an address other than the nominee. | Call from the nominated governance address. |
+| 6 | `InvalidCampaignWindow` | `create_campaign` was given `end_time <= start_time`. | Ensure `start_time < end_time`. |
+| 7 | `InvalidRewardRate` | `create_campaign` or `set_campaign_rate` was given a zero or negative rate. | Specify a reward rate > 0. |
+| 8 | `InvalidFundingAmount` | `create_campaign` was given a zero or negative funding amount. | Supply positive reward funding. |
+| 9 | `InsufficientFunding` | Funding is less than `reward_rate * (end_time - start_time)`. | Fund at least the campaign's maximum payout. |
+| 10 | `LpTokenMismatch` | The LP token's admin is not the given pool. | Pass the LP token that belongs to the pool. |
+| 11 | `CampaignNotFound` | No campaign exists with the given id. | Use an id returned by `create_campaign` / `list_campaigns_paginated`. |
+| 12 | `CampaignNotEnded` | `recover_leftover_funds` was called before `end_time`. | Wait for the campaign to end before recovering unallocated funds. |
+| 13 | `NoLeftoverFunds` | `recover_leftover_funds` found nothing left to recover. | No action needed; funds fully distributed. |
+| 14 | `CampaignInactive` | `claim_rewards` or `recover_leftover_funds` was called on a campaign that has already been deactivated by leftover recovery. | No further claims or recoveries are possible on this campaign. |
+| 15 | `CampaignNotStarted` | `claim_rewards` was called before `start_time`. | Wait for the campaign start timestamp. |
+| 16 | `NoLpBalance` | The claiming provider holds 0 LP tokens. | Deposit liquidity to earn LP tokens before claiming. |
+| 17 | `NoLpSupply` | The LP token's total supply is 0. | Seed the pool with liquidity. |
+| 18 | `NoPendingRewards` | The provider has no rewards accrued since their last claim. | Wait for rewards to accumulate over time. |
+| 19 | `RecordNotFound` | `get_distribution_record` was given an unknown id. | Use an id from `list_distribution_records` / `get_claim_history`. |
+
+-----------------------|-------|--------|
 | `already initialized` | Contract initialized twice. | Initialize once upon deployment. |
 | `not governance` | Restricted method called by non-governance account. | Call using governance credentials. |
 | `not pending governance` | `accept_governance` called by non-nominee. | Call from nominated governance address. |
@@ -376,6 +409,11 @@ Defined in [contracts/oracle_aggregator/src/lib.rs](../contracts/oracle_aggregat
 | 6 | `InsufficientSources` | Fewer active sources available than required quorum. | Register additional valid oracle sources. |
 | 7 | `InvalidStaleness` | Max staleness parameter is 0 or invalid. | Set positive max staleness duration. |
 | 8 | `InvalidDeviation` | Max allowed price deviation parameter out of bounds. | Set valid deviation threshold. |
+| 9 | `InvalidWeight` | A source weight was zero or exceeded `MAX_SOURCE_WEIGHT`. | Use a positive value. |
+| 10 | `WeightFloorNotMet` | Total agreeing weight fell below the floor. | Register more sources or increase weights. |
+| 11 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
+| 12 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 13 | `Paused` | The aggregator has been paused. | Wait for the admin to call `unpause`. |
 
 ---
 
@@ -409,61 +447,77 @@ Defined in [contracts/reserve_manager/src/lib.rs](../contracts/reserve_manager/s
 | 3 | `AlreadyInitialized` | Reserve manager initialized twice. | Initialize once upon deployment. |
 | 4 | `NegativeReserveAmount` | `min_reserve` specified as negative value. | Pass non-negative reserve amount. |
 | 5 | `BatchTooLarge` | `check_reserves_batch` called with more than `MAX_PAGE` (50) pools. | Split the pool list into batches of at most 50. |
+| 6 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
+| 7 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 8 | `Paused` | Contract is administratively paused. | Wait for governance to call `unpause`. |
 
 ---
 
 ## Router (`contracts/router`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs)).
+Defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs) as `RouterError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
-| `already initialized` | `initialize` called twice (`DataKey::Factory` exists). | Initialize router contract once. |
-| `path must have at least 2 tokens` | `path.len() < 2` in swap/quote functions. | Pass path array containing ≥ 2 token addresses. |
-| `amount_in must be positive` | `amount_in <= 0` in `swap_exact_in`, `get_amount_out_path` or `get_amounts_out_path`. | Pass strictly positive input amount. |
-| `amount_out must be positive` | `amount_out <= 0` in `swap_exact_out`, `get_amount_in_path` or `get_amounts_in_path`. | Pass strictly positive output amount. |
-| `DuplicateAdjacentToken at hop {i}` | `path[i] == path[i + 1]`, which resolves to a pool that cannot exist. | Remove the repeated token from the path. |
-| `DeadlineExpired` | `env.ledger().timestamp() > deadline`. | Re-submit swap with future deadline. |
-| `no pool for hop {i}` | Factory returned no pool for token pair at hop `i`. | Ensure liquidity pool exists for every adjacent pair in path; call `is_path_routable` to check before quoting. |
-| `Slippage exceeded` | Output `< min_amount_out` or input `> max_in`. | Widen slippage bounds or recalculate path quote. |
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called twice (`DataKey::Factory` already exists). | Initialize the router contract once. |
+| 2 | `NotInitialized` | A function was called before `initialize` (the factory address is unset). | Call `initialize` first. |
+| 3 | `InvalidPath` | `path.len() < 2` in a swap or quote function. | Pass a path containing at least two token addresses. |
+| 4 | `DuplicateAdjacentToken` | `path[i] == path[i + 1]`, which resolves to a pool that cannot exist. | Remove the repeated token from the path. |
+| 5 | `InvalidAmount` | An input or output amount was zero or negative. | Pass a strictly positive amount. |
+| 6 | `DeadlineExceeded` | `env.ledger().timestamp() > deadline`. | Re-submit the swap with a future deadline. |
+| 7 | `PoolNotFound` | The factory returned no pool for the token pair at some hop. | Ensure a pool exists for every adjacent pair; call `is_path_routable` to check before quoting. |
+| 8 | `SlippageExceeded` | Realized output `< min_amount_out`, or required input `> max_in`. | Widen the slippage bounds or recalculate the path quote. |
+| 9 | `Paused` | `swap_exact_in` or `swap_exact_out` was called while the router is paused. Quotes and path views stay callable. | Wait for the admin to call `unpause`; check `is_paused` first. |
+| 10 | `Unauthorized` | `pause` or `unpause` was called with an `admin` address that does not match the stored admin. | Pass the stored admin address and sign with its key. |
 
 ---
 
 ## Staking (`contracts/staking`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/staking/src/lib.rs](../contracts/staking/src/lib.rs)).
+Defined in [contracts/staking/src/lib.rs](../contracts/staking/src/lib.rs) as `StakingError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
-| `already initialized` | Contract initialized twice. | Initialize contract once. |
-| `contract is paused` | Action attempted while contract paused. | Wait for admin to unpause contract. |
-| `not admin` | Restricted function called by non-admin. | Call from stored admin address. |
-| `nothing staked` | Action attempted by user with 0 staked balance. | Stake tokens before withdrawing/claiming. |
-| `amount must be positive` | Amount supplied is zero or negative. | Provide strictly positive token amount. |
-| `insufficient staked amount` | Withdrawal requested exceeds user staked balance. | Withdraw ≤ staked balance. |
-| `tokens are still locked` | Unstake called before lock duration expires (`now < lock_expiry`). | Wait for lock duration to elapse. |
-| `no active lock to extend` | `extend_lock` called with no active lock. | Stake with lock duration first. |
-| `duration must be positive` | Lock duration set to 0. | Specify positive lock duration seconds. |
-| `no pending rewards` | Claim attempted with 0 pending rewards. | Allow rewards to accrue over time. |
-| `batch too large: settle_boost_batch is capped at MAX_BATCH_SIZE entries per call` | `settle_boost_batch` called with more than `MAX_BATCH_SIZE` (50) addresses. | Split the batch into chunks of ≤ 50 addresses per call. |
-| `batch too large: register_existing_stakers is capped at MAX_BATCH_SIZE entries per call` | `register_existing_stakers` migration call given more than `MAX_BATCH_SIZE` (50) addresses. | Split the backfill list into chunks of ≤ 50 addresses per call. |
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` (or `initialize_with_boost_config`) was called on a pool that is already set up. | Initialize the contract once. |
+| 2 | `NotInitialized` | A function was called before `initialize` (the LP token / admin is unset). | Call `initialize` first. |
+| 3 | `Unauthorized` | A restricted function was called by an address other than the stored admin. | Call from the stored admin address. |
+| 4 | `Paused` | `stake`, `stake_locked`, `claim`, or `extend_lock` was attempted while paused. | Wait for the admin to `unpause`. |
+| 5 | `InvalidAmount` | An amount argument was zero or negative where a positive value is required. | Provide a strictly positive amount. |
+| 6 | `NothingStaked` | An action was attempted by an address with a zero staked balance. | Stake tokens before withdrawing, unlocking, or emergency-withdrawing. |
+| 7 | `InsufficientStaked` | An unstake requested more than the staker's staked balance. | Unstake an amount no greater than the staked balance. |
+| 8 | `StillLocked` | `unstake` was called before the lock expired (`now < lock_expiry`). | Wait for the lock duration to elapse. |
+| 9 | `NoPendingRewards` | `claim` was attempted with zero pending rewards. | Allow rewards to accrue before claiming. |
+| 10 | `EmergencyModeNotActive` | `emergency_withdraw` was called while emergency mode is off. | Wait for the admin to enable emergency mode. |
+| 11 | `NoActiveLock` | `extend_lock` was called on a position with no active lock. | Stake with a lock duration first. |
+| 12 | `InvalidDuration` | A lock duration argument was zero where a positive value is required. | Specify a positive lock duration in seconds. |
+| 13 | `NothingToStake` | A stake call supplied neither a positive amount nor a lock duration. | Pass a positive amount, a lock duration, or both. |
+| 14 | `InvalidBoostConfig` | The boost bounds were non-positive, or the max was below the min. | Pass `0 < min_boost <= max_boost`. |
+| 15 | `InvalidLockDuration` | The lock-duration bounds were non-positive, or the max was below the min. | Pass `0 < min_lock_duration <= max_lock_duration`. |
+| 16 | `MaxRewardPoolExceeded` | `add_rewards` would push the pool balance above the configured cap. | Lower the amount added, or raise the cap with `set_max_reward_pool_balance`. |
+| 17 | `InvalidMaxBalance` | A new max-balance cap was set below the current pool balance. | Use a cap of `0` (no cap) or one at least the current balance. |
+| 18 | `NoStakers` | `update_rewards` was called while the pool has no effective stake. | Wait until at least one address has staked. |
+| 19 | `BatchTooLarge` | `settle_boost_batch` or `register_existing_stakers` was given more than `MAX_BATCH_SIZE` (50) addresses. | Split the list into chunks of at most 50 addresses per call. |
+| 20 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
+| 21 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
 
 ---
 
 ## Token (`contracts/token`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/token/src/lib.rs](../contracts/token/src/lib.rs)).
+Defined in [contracts/token/src/lib.rs](../contracts/token/src/lib.rs) as `TokenError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
-| `already initialized` | Token contract initialized twice. | Initialize once upon deployment. |
-| `amount must be positive` | Amount specified is zero or negative (`amount <= 0`). | Pass strictly positive amount. |
-| `amount must be non-negative` | Allowance amount negative (`amount < 0`). | Pass non-negative allowance. |
-| `insufficient balance` | Transfer or burn amount exceeds account balance. | Transfer/burn ≤ available balance. |
-| `insufficient allowance` | `transfer_from` or `burn_from` exceeds approved allowance. | Approve sufficient allowance prior to transfer. |
-| `current_admin is not admin` | Admin transfer called by unauthorized address. | Call from current admin account. |
-| `not pending admin` | `claim_admin` called by non-nominee. | Call from nominated pending admin address. |
-| `migrate amount exceeds total locked` | Migration amount exceeds total locked token balance. | Migrate amount ≤ total locked tokens. |
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | The token contract was initialized twice. | Initialize once upon deployment. |
+| 2 | `NotInitialized` | A function was called before `initialize` (the admin is unset). | Initialize the token first. |
+| 3 | `InvalidAmount` | An amount was zero or negative where a positive value is required, or negative where a non-negative value is required. | Pass a valid amount. |
+| 4 | `InsufficientBalance` | A transfer, burn, or lock exceeded the account's unlocked balance. | Operate on no more than the available unlocked balance. |
+| 5 | `InsufficientAllowance` | `transfer_from` exceeded the spender's approved allowance. | Approve a sufficient allowance before transferring. |
+| 6 | `InvalidExpiry` | `approve` was given a `live_until_ledger` before the current ledger for a non-zero amount. | Pass a `live_until_ledger` at or after the current ledger. |
+| 7 | `Unauthorized` | `propose_admin` was called by a non-admin, or `accept_admin` by a non-nominee. | Call from the correct admin or nominated pending-admin address. |
+| 8 | `InsufficientLocked` | An unlock exceeded the locker's entry for the holder, or the holder's total locked balance. | Unlock no more than the locker locked for the holder. |
+| 9 | `MigrationOverflow` | A legacy-lock migration would allocate more than the holder's recorded total locked balance. | Migrate an amount within the total locked balance. |
+| 10 | `BalanceUnavailable` | `balance_at` was queried for a ledger whose covering checkpoint has been evicted. | Query a ledger within the retained checkpoint window. |
 
 ---
 
@@ -600,6 +654,5 @@ bash scripts/check_error_docs.sh
 ```
 
 CI automatically runs `make check-docs` on every pull request and push to prevent documentation drift.
-=======
 (TODO)
 

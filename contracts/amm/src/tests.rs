@@ -2748,3 +2748,151 @@ fn test_multisig_new_cosigner_refreshes_window_and_quorum_executes() {
         "recipient should receive token_b reserves"
     );
 }
+
+/// Guard against event-schema-versioning regressions (#921).
+///
+/// Walks the full event log emitted across a representative call sequence and
+/// asserts that every event published by the pool carries a leading
+/// `EVENT_SCHEMA_VERSION` stamp. This catches any new raw
+/// `env.events().publish(...)` site that skips `emit_versioned_event!`,
+/// without needing one assertion per topic.
+#[test]
+fn test_every_emitted_event_carries_version_stamp() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{IntoVal, Val};
+
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    // A sequence that exercises a broad spread of the pool's event sites,
+    // including the ones migrated in #921 (`fee_upd`, `protocol_fee_set`).
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &2_000_000_i128);
+    tb_sac.mint(&provider, &2_000_000_i128);
+    let shares = AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &100_000_i128);
+    Swap::new(&amm, &trader, &ts.ta_addr, 100_000).execute();
+
+    amm.update_fee(&50_i128);
+    amm.set_protocol_fee(&ts.admin, &ts.admin, &10_i128);
+
+    RemoveLiquidity::new(&amm, &provider, shares / 2).execute();
+
+    let events = env.events().all();
+    let mut pool_events = 0u32;
+    for e in events.iter() {
+        // Only the pool's own events are versioned; token/SAC sub-calls emit
+        // their own unversioned events and are out of scope here.
+        if e.0 != amm.address {
+            continue;
+        }
+        pool_events += 1;
+        // Every pool event is published as `(EVENT_SCHEMA_VERSION, payload)`.
+        let decoded: (u32, Val) = e.2.into_val(env);
+        assert_eq!(
+            decoded.0,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event with topics {:?} is missing the schema version stamp",
+            e.1
+        );
+    }
+    assert!(
+        pool_events > 0,
+        "expected the call sequence to emit at least one pool event"
+    );
+}
+
+// ── #928: typed NotInitialized instead of a host trap ─────────────────────────
+
+#[test]
+fn test_pre_init_calls_return_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amm_addr = env.register_contract(None, AmmPool);
+    let client = AmmPoolClient::new(&env, &amm_addr);
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Admin setters
+    assert_eq!(
+        client.try_set_oracle(&admin, &None),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_max_oracle_deviation_bps(&admin, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(client.try_pause(), Err(Ok(AmmError::NotInitialized)));
+    assert_eq!(client.try_unpause(), Err(Ok(AmmError::NotInitialized)));
+    assert_eq!(
+        client.try_set_protocol_fee(&admin, &user, &10),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_lp_rebate(&admin, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_update_fee(&30),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_update_flash_loan_fee(&9),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_propose_admin(&admin, &user),
+        Err(Ok(AmmError::NotInitialized))
+    );
+
+    // Liquidity and swaps
+    assert_eq!(
+        client.try_add_liquidity(&user, &1_000, &1_000, &0, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_remove_liquidity(&user, &100, &0, &0, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_swap(&user, &token, &100, &0, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_swap_exact_out(&user, &token, &100, &1_000, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_withdraw_protocol_fees(),
+        Err(Ok(AmmError::NotInitialized))
+    );
+
+    // Quotes and views
+    assert_eq!(
+        client.try_get_amount_out(&token, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_get_amount_in(&token, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert!(matches!(
+        client.try_simulate_swap(&token, &100),
+        Err(Ok(AmmError::NotInitialized))
+    ));
+    assert_eq!(client.try_get_fee_info(), Err(Ok(AmmError::NotInitialized)));
+    assert!(matches!(
+        client.try_get_info(),
+        Err(Ok(AmmError::NotInitialized))
+    ));
+    assert_eq!(
+        client.try_shares_of(&user),
+        Err(Ok(AmmError::NotInitialized))
+    );
+}

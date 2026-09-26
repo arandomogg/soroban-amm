@@ -36,6 +36,23 @@ pub enum FactoryError {
     FeeNotConfigured = 7,
     RateLimitExceeded = 8,
     CreationPaused = 9,
+    /// `accept_admin` called without a prior `propose_admin`.
+    NoPendingAdmin = 10,
+    /// `accept_admin` called by an address other than the nominee.
+    WrongAdmin = 11,
+    /// A function that reads factory configuration (admin, AMM/LP WASM
+    /// hashes) was called before `initialize`. Discriminant 2 is taken by
+    /// `InvalidFeeBps`, so this is appended rather than renumbered.
+    NotInitialized = 12,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolState {
+    pub sqrt_price: u128,
+    pub current_tick: i32,
+    pub active_liquidity: i128,
+    pub tick_spacing: i32,
 }
 
 #[contractclient(name = "ClPoolClient")]
@@ -50,7 +67,7 @@ pub trait ClPoolInterface {
         tick_spacing: i32,
     );
 
-    fn get_pool_state(env: Env) -> concentrated_liquidity::PoolState;
+    fn get_pool_state(env: Env) -> PoolState;
 }
 
 #[contractclient(name = "AmmPoolClient")]
@@ -130,6 +147,7 @@ pub enum DataKey {
     GlobalProtocolFeeBps, // i128 — global protocol fee rate (0 = off)
     PoolTokens(Address), // pool address → (token_a, token_b) for sweep forwarding
     CreationPaused, // bool — true blocks new V2 and CL pool creation
+    PendingAdmin, // Option<Address> — nominee for two-step admin rotation
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -315,7 +333,7 @@ impl Factory {
         }
 
         // ── Auth, rate-limit, fee ─────────────────────────────────────────
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         let permissionless: bool = env
             .storage()
             .instance()
@@ -330,12 +348,8 @@ impl Factory {
             admin.require_auth();
         }
 
-        let amm_wasm: BytesN<32> = env.storage().instance().get(&DataKey::AmmWasmHash).unwrap();
-        let token_wasm: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::TokenWasmHash)
-            .unwrap();
+        let amm_wasm = Self::read_amm_wasm_hash(&env)?;
+        let token_wasm = Self::read_token_wasm_hash(&env)?;
 
         // Derive salts per pool from a monotonic counter.
         // We use n * 3 for LP salt, n * 3 + 1 for Pool salt, n * 3 + 2 for Governance salt.
@@ -473,6 +487,7 @@ impl Factory {
     ) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if let Some(ref h) = amm_wasm_hash {
             env.storage().instance().set(&DataKey::AmmWasmHash, h);
@@ -496,6 +511,7 @@ impl Factory {
     pub fn set_default_fee_tier(env: Env, fee_tier: i128) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         // Validate the fee tier
@@ -504,9 +520,10 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::DefaultFeeTier, &fee_tier);
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "default_fee_tier_updated"),),
-            (fee_tier,),
+            (fee_tier,)
         );
         Ok(())
     }
@@ -518,11 +535,15 @@ impl Factory {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
-        env.events()
-            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "upgraded"),),
+            (new_wasm_hash,)
+        );
         Ok(())
     }
 
@@ -530,6 +551,7 @@ impl Factory {
     pub fn set_cl_wasm_hash(env: Env, cl_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -610,7 +632,7 @@ impl Factory {
         }
 
         // ── Auth, rate-limit, fee ─────────────────────────────────────────
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         let permissionless: bool = env
             .storage()
             .instance()
@@ -711,6 +733,7 @@ impl Factory {
     pub fn set_permissionless_mode(env: Env, enabled: bool) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -735,6 +758,7 @@ impl Factory {
     ) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if fee_amount <= 0 {
             return Err(FactoryError::FeeNotConfigured);
@@ -758,11 +782,63 @@ impl Factory {
     pub fn set_rate_limit(env: Env, min_ledgers: u32) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::RateLimitLedgers, &min_ledgers);
         Ok(())
+    }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), FactoryError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "admin_nominated"),),
+            (admin, new_admin)
+        );
+        Ok(())
+    }
+
+    /// Accept the pending admin nomination. Caller becomes the new admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(FactoryError::NoPendingAdmin)?;
+        if new_admin != nominee {
+            return Err(FactoryError::WrongAdmin);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "admin_changed"),),
+            (new_admin,)
+        );
+        Ok(())
+    }
+
+    /// Return current admin address, or `None` if unset.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Return pending admin nominee, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -994,6 +1070,7 @@ impl Factory {
             return Err(FactoryError::Unauthorized);
         }
         admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         if !(0..=10_000).contains(&global_protocol_fee_bps) {
             return Err(FactoryError::InvalidFeeBps);
         }
@@ -1059,6 +1136,7 @@ impl Factory {
             return Err(FactoryError::Unauthorized);
         }
         admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         if !env.storage().instance().has(&DataKey::Treasury) {
             return Err(FactoryError::FeeNotConfigured);
         }
@@ -1092,6 +1170,7 @@ impl Factory {
             return Err(FactoryError::Unauthorized);
         }
         admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         if !env.storage().instance().has(&DataKey::Treasury) {
             return Err(FactoryError::FeeNotConfigured);
         }
@@ -1246,8 +1325,30 @@ impl Factory {
             .unwrap_or(0u64) as u32
     }
 
+    /// Stored admin, written by `initialize`; absent means not initialized.
+    fn read_admin(env: &Env) -> Result<Address, FactoryError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(FactoryError::NotInitialized)
+    }
+
+    fn read_amm_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AmmWasmHash)
+            .ok_or(FactoryError::NotInitialized)
+    }
+
+    fn read_token_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenWasmHash)
+            .ok_or(FactoryError::NotInitialized)
+    }
+
     fn require_admin(env: &Env, admin: &Address) -> Result<(), FactoryError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin = Self::read_admin(env)?;
         if *admin != stored_admin {
             return Err(FactoryError::Unauthorized);
         }
@@ -3123,5 +3224,258 @@ mod tests {
 
         assert_eq!(factory.get_default_fee_tier(), 1);
         assert_instance_ttl_bumped(&env, &factory_addr);
+    // ── Issue #923: no event escapes the version stamp ────────────────────────
+    //
+    // Rather than one assertion per topic, this walks the whole event log for a
+    // representative call sequence and asserts every payload this contract
+    // emitted begins with `EVENT_SCHEMA_VERSION`. A newly added raw
+    // `env.events().publish(...)` reachable from the sequence regresses this
+    // test, which is the guard the half-migrated state lacked.
+    #[test]
+    fn test_every_emitted_event_carries_version_stamp() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{TryFromVal, Val};
+
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Pool creation: pool_created.
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+
+        // Admin-config surface: default_fee_tier_updated, creation_paused,
+        // creation_unpaused, mode_changed.
+        factory.set_default_fee_tier(&2_i128);
+        factory.pause_creation(&admin);
+        factory.unpause_creation(&admin);
+        factory.set_permissionless_mode(&true);
+
+        // WASM rotation last, since it points the contract at new bytecode:
+        // upgraded.
+        factory.upgrade(&token_hash);
+
+        // Every event this contract published must decode as `(u32, _)` with the
+        // leading `u32` equal to the current schema version. Events emitted by
+        // the deployed pool/token contracts are filtered out by address.
+        let mut checked = 0u32;
+        for event in env.events().all().iter() {
+            if event.0 != factory_addr {
+                continue;
+            }
+            let payload: soroban_sdk::Vec<Val> = soroban_sdk::Vec::try_from_val(&env, &event.2)
+                .expect("every factory event payload is a versioned tuple");
+            let head = payload.get(0).expect("versioned payload is never empty");
+            let version = u32::try_from_val(&env, &head)
+                .expect("leading element of every factory event is the u32 version");
+            assert_eq!(
+                version,
+                soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+                "event with topics {:?} is missing the schema version stamp",
+                event.1
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 5,
+            "representative sequence should emit several factory events, saw {checked}"
+        );
+    }
+
+    #[test]
+    fn test_admin_rotation_happy_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        factory.initialize(&admin, &dummy_hash, &dummy_hash);
+
+        let new_admin = Address::generate(&env);
+        assert_eq!(factory.get_admin(), Some(admin.clone()));
+        assert_eq!(factory.get_pending_admin(), None);
+
+        // Propose admin
+        factory.propose_admin(&admin, &new_admin);
+        assert_eq!(factory.get_pending_admin(), Some(new_admin.clone()));
+        assert_eq!(factory.get_admin(), Some(admin.clone()));
+
+        // Accept admin
+        factory.accept_admin(&new_admin);
+        assert_eq!(factory.get_admin(), Some(new_admin.clone()));
+        assert_eq!(factory.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_propose_admin_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let rando = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        factory.initialize(&admin, &dummy_hash, &dummy_hash);
+
+        let new_admin = Address::generate(&env);
+        assert_eq!(
+            factory.try_propose_admin(&rando, &new_admin),
+            Err(Ok(FactoryError::Unauthorized))
+        );
+        assert_eq!(factory.get_pending_admin(), None);
+        assert_eq!(factory.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_accept_admin_wrong_address_or_no_pending() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let rando = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        factory.initialize(&admin, &dummy_hash, &dummy_hash);
+
+        let new_admin = Address::generate(&env);
+
+        // Accept without prior proposal
+        assert_eq!(
+            factory.try_accept_admin(&new_admin),
+            Err(Ok(FactoryError::NoPendingAdmin))
+        );
+
+        // Propose to new_admin
+        factory.propose_admin(&admin, &new_admin);
+
+        // Wrong address calling accept_admin
+        assert_eq!(
+            factory.try_accept_admin(&rando),
+            Err(Ok(FactoryError::WrongAdmin))
+        );
+        assert_eq!(factory.get_admin(), Some(admin));
+    }
+
+    // ── #932: typed NotInitialized instead of host traps ─────────────────────
+
+    fn uninitialized_factory(env: &Env) -> FactoryClient<'_> {
+        env.mock_all_auths();
+        let factory_addr = env.register_contract(None, Factory);
+        FactoryClient::new(env, &factory_addr)
+    }
+
+    #[test]
+    fn test_pre_init_pool_creation_returns_not_initialized() {
+        let env = Env::default();
+        let factory = uninitialized_factory(&env);
+        let caller = Address::generate(&env);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+
+        assert_eq!(
+            factory.try_create_pool(&caller, &token_a, &token_b, &2_i128, &None),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_create_pool_with_fee_bps(&caller, &token_a, &token_b, &30_i128, &None),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_create_cl_pool(&caller, &token_a, &token_b, &30_i128, &0_i32),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_pre_init_admin_entrypoints_return_not_initialized() {
+        let env = Env::default();
+        let factory = uninitialized_factory(&env);
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+
+        assert_eq!(
+            factory.try_update_wasm_hashes(&Some(hash.clone()), &None),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_default_fee_tier(&1_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_upgrade(&hash),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_cl_wasm_hash(&hash),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_pause_creation(&admin),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_unpause_creation(&admin),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_permissionless_mode(&true),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_pool_creation_fee(&other, &100_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_rate_limit(&5_u32),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_propose_admin(&admin, &other),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_treasury(&admin, &other, &100_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_global_fee(&admin, &100_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_global_fee_paginated(&admin, &0_u32, &10_u32),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_pre_init_other_entrypoints_do_not_trap() {
+        let env = Env::default();
+        let factory = uninitialized_factory(&env);
+        let someone = Address::generate(&env);
+
+        // Entry points that never read admin/WASM config keep their own
+        // typed errors or empty defaults.
+        assert_eq!(
+            factory.try_accept_admin(&someone),
+            Err(Ok(FactoryError::NoPendingAdmin))
+        );
+        assert_eq!(
+            factory.try_sweep_fees(&someone),
+            Err(Ok(FactoryError::FeeNotConfigured))
+        );
+        assert_eq!(factory.get_admin(), None);
+        assert_eq!(factory.get_pool_count(), 0);
+        assert!(!factory.is_creation_paused());
     }
 }

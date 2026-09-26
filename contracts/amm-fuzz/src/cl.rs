@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Property-based tests for the concentrated-liquidity engine.
 //!
 //! The V2 suite in `lib.rs` targets the constant-product pool. The
@@ -36,208 +37,8 @@ use proptest::prelude::*;
 ///
 /// Copied verbatim from `concentrated_liquidity/src/math.rs` so the properties
 /// below exercise the exact code the contract links, not a re-derivation.
-pub mod math {
-    #![allow(dead_code)]
-
-    /// 2^96 as u128
-    pub const Q96: u128 = 79_228_162_514_264_337_593_543_950_336_u128; // 1 << 96
-
-    pub const MIN_TICK: i32 = -887_272;
-    pub const MAX_TICK: i32 = 887_272;
-
-    /// Minimum sqrt price: tick_to_sqrt_price_x96(MIN_TICK)
-    pub const MIN_SQRT_PRICE: u128 = 4_295_128_739_u128;
-    /// Maximum sqrt price representable in u128 (Uniswap V3's true max exceeds
-    /// u128 range; the contract caps at the highest value that fits).
-    pub const MAX_SQRT_PRICE: u128 = 340_275_971_719_517_849_884_931_781_110_561_029_923_u128;
-
-    pub fn tick_to_sqrt_price_x96(tick: i32) -> u128 {
-        assert!((MIN_TICK..=MAX_TICK).contains(&tick), "tick out of range");
-
-        if tick > 0 {
-            let inv_sqrt_price = tick_to_sqrt_price_x96(-tick);
-            let sqrt_price = div_pow2(192, inv_sqrt_price);
-            return sqrt_price.clamp(MIN_SQRT_PRICE, MAX_SQRT_PRICE);
-        }
-
-        let abs_tick = tick.unsigned_abs() as u64;
-
-        let mut ratio: u128 = if abs_tick & 0x1 != 0 {
-            0xfffcb933bd6fad37aa2d162d1a594001_u128
-        } else {
-            u128::MAX
-        };
-
-        macro_rules! apply_bit {
-            ($bit:expr, $magic:expr) => {
-                if abs_tick & (1u64 << $bit) != 0 {
-                    ratio = mul_shift128(ratio, $magic);
-                }
-            };
-        }
-
-        apply_bit!(1, 0xfff97272373d413259a46990580e213a_u128);
-        apply_bit!(2, 0xfff2e50f5f656932ef12357cf3c7fdcc_u128);
-        apply_bit!(3, 0xffe5caca7e10e4e61c3624eaa0941cd0_u128);
-        apply_bit!(4, 0xffcb9843d60f6159c9db58835c926644_u128);
-        apply_bit!(5, 0xff973b41fa98c081472e6896dfb254c0_u128);
-        apply_bit!(6, 0xff2ea16466c96a3843ec78b326b52861_u128);
-        apply_bit!(7, 0xfe5dee046a99a2a811c461f1969c3053_u128);
-        apply_bit!(8, 0xfcbe86c7900a88aedcffc83b479aa3a4_u128);
-        apply_bit!(9, 0xf987a7253ac413176f2b074cf7815e54_u128);
-        apply_bit!(10, 0xf3392b0822b70005940c7a398e4b70f3_u128);
-        apply_bit!(11, 0xe7159475a2c29b7443b29c7fa6e889d9_u128);
-        apply_bit!(12, 0xd097f3bdfd2022b8845ad8f792aa5825_u128);
-        apply_bit!(13, 0xa9f746462d870fdf8a65dc1f90e061e5_u128);
-        apply_bit!(14, 0x70d869a156d2a1b890bb3df62baf32f7_u128);
-        apply_bit!(15, 0x31be135f97d08fd981231505542fcfa6_u128);
-        apply_bit!(16, 0x9aa508b5b7a84e1c677de54f3e99bc9_u128);
-        apply_bit!(17, 0x5d6af8dedb81196699c329225ee604_u128);
-        apply_bit!(18, 0x2216e584f5fa1ea926041bedfe98_u128);
-        apply_bit!(19, 0x48a170391f7dc42444e8fa2_u128);
-
-        let sqrt_price = (ratio >> 32)
-            + if (ratio & 0xFFFFFFFF) >= 0x80000000 {
-                1
-            } else {
-                0
-            };
-
-        sqrt_price.clamp(MIN_SQRT_PRICE, MAX_SQRT_PRICE)
-    }
-
-    #[inline(always)]
-    fn mul_shift128(a: u128, b: u128) -> u128 {
-        let a_hi = a >> 64;
-        let a_lo = a & 0xFFFFFFFFFFFFFFFF;
-        let b_hi = b >> 64;
-        let b_lo = b & 0xFFFFFFFFFFFFFFFF;
-
-        let top = a_hi * b_hi;
-        let mid1 = a_hi * b_lo;
-        let mid2 = a_lo * b_hi;
-        let _bot = a_lo * b_lo;
-
-        let mid_sum = (mid1 >> 64).wrapping_add(mid2 >> 64);
-        let mid_lo_carry =
-            ((mid1 & 0xFFFFFFFFFFFFFFFF).wrapping_add(mid2 & 0xFFFFFFFFFFFFFFFF)) >> 64;
-
-        top.wrapping_add(mid_sum).wrapping_add(mid_lo_carry)
-    }
-
-    fn div_pow2(pow: u32, d: u128) -> u128 {
-        debug_assert!(d != 0, "division by zero");
-        let mut rem: u128 = 0;
-        let mut quo: u128 = 0;
-        for i in (0..=pow).rev() {
-            rem = (rem << 1) | u128::from(i == pow);
-            if quo >> 127 != 0 {
-                return u128::MAX;
-            }
-            quo <<= 1;
-            if rem >= d {
-                rem -= d;
-                quo |= 1;
-            }
-        }
-        quo
-    }
-
-    pub fn sqrt_price_x96_to_tick(sqrt_price: u128) -> i32 {
-        assert!(
-            (MIN_SQRT_PRICE..=MAX_SQRT_PRICE).contains(&sqrt_price),
-            "sqrt price out of range"
-        );
-
-        let mut lo = MIN_TICK;
-        let mut hi = MAX_TICK;
-
-        while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
-            if tick_to_sqrt_price_x96(mid) <= sqrt_price {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-
-        lo
-    }
-
-    pub fn get_amount0_delta(mut sqrt_a: u128, mut sqrt_b: u128, liquidity: i128) -> i128 {
-        if sqrt_a > sqrt_b {
-            core::mem::swap(&mut sqrt_a, &mut sqrt_b);
-        }
-        if sqrt_a == 0 || sqrt_b == 0 || liquidity == 0 || sqrt_a == sqrt_b {
-            return 0;
-        }
-        let abs_liq = liquidity.unsigned_abs();
-        let numerator = mul_u128_u96(abs_liq, sqrt_b - sqrt_a);
-        let denominator = mul_shift128(sqrt_a, sqrt_b).wrapping_shl(32);
-        let abs_result = numerator.checked_div(denominator).unwrap_or(0);
-        if liquidity >= 0 {
-            abs_result as i128
-        } else {
-            -(abs_result as i128)
-        }
-    }
-
-    pub fn get_amount1_delta(mut sqrt_a: u128, mut sqrt_b: u128, liquidity: i128) -> i128 {
-        if sqrt_a > sqrt_b {
-            core::mem::swap(&mut sqrt_a, &mut sqrt_b);
-        }
-        if liquidity == 0 || sqrt_a == sqrt_b {
-            return 0;
-        }
-        let abs_liq = liquidity.unsigned_abs();
-        let abs_result = mul_u128_u96(abs_liq, sqrt_b - sqrt_a) / Q96;
-        if liquidity >= 0 {
-            abs_result as i128
-        } else {
-            -(abs_result as i128)
-        }
-    }
-
-    pub fn get_liquidity_for_amount0(mut sqrt_a: u128, mut sqrt_b: u128, amount0: i128) -> i128 {
-        if sqrt_a > sqrt_b {
-            core::mem::swap(&mut sqrt_a, &mut sqrt_b);
-        }
-        if sqrt_b == sqrt_a || amount0 == 0 {
-            return 0;
-        }
-        let abs_amt = amount0.unsigned_abs();
-        let product = mul_shift128(sqrt_a, sqrt_b).wrapping_shl(32);
-        let abs_result = mul_u128_u96(abs_amt, product) / (sqrt_b - sqrt_a);
-        if amount0 >= 0 {
-            abs_result as i128
-        } else {
-            -(abs_result as i128)
-        }
-    }
-
-    pub fn get_liquidity_for_amount1(mut sqrt_a: u128, mut sqrt_b: u128, amount1: i128) -> i128 {
-        if sqrt_a > sqrt_b {
-            core::mem::swap(&mut sqrt_a, &mut sqrt_b);
-        }
-        if sqrt_b == sqrt_a || amount1 == 0 {
-            return 0;
-        }
-        let abs_amt = amount1.unsigned_abs();
-        let abs_result = mul_u128_u96(abs_amt, Q96) / (sqrt_b - sqrt_a);
-        if amount1 >= 0 {
-            abs_result as i128
-        } else {
-            -(abs_result as i128)
-        }
-    }
-
-    #[inline(always)]
-    fn mul_u128_u96(a: u128, b: u128) -> u128 {
-        let b_lo = b & 0xFFFFFFFFFFFFFFFF;
-        let b_hi = b >> 64;
-        (a * b_lo).wrapping_add((a * b_hi).wrapping_shl(64))
-    }
-}
+#[path = "../../concentrated_liquidity/src/math.rs"]
+pub mod math;
 
 /// Pure mirror of the CL packed tick bitmap.
 ///
@@ -558,6 +359,71 @@ proptest! {
             prop_assert!(p_next > price_hi, "price_to_tick not the largest floor tick");
         }
     }
+
+    #[test]
+    fn prop_math_sqrt_price_to_tick(
+        price in math::MIN_SQRT_PRICE..=math::MAX_SQRT_PRICE,
+    ) {
+        let tick = math::sqrt_price_x96_to_tick(price);
+        let p_t = math::tick_to_sqrt_price_x96(tick);
+        prop_assert!(p_t <= price, "floor tick price exceeds target");
+        if tick < math::MAX_TICK {
+            let p_next = math::tick_to_sqrt_price_x96(tick + 1);
+            prop_assert!(p_next > price, "next tick price not strictly greater");
+        }
+    }
+
+    #[test]
+    fn prop_math_liquidity_for_amounts(
+        sqrt_a in math::MIN_SQRT_PRICE..=math::MAX_SQRT_PRICE,
+        sqrt_b in math::MIN_SQRT_PRICE..=math::MAX_SQRT_PRICE,
+        sqrt_current in math::MIN_SQRT_PRICE..=math::MAX_SQRT_PRICE,
+        amount0 in 0_i128..=1_000_000_000_i128,
+        amount1 in 0_i128..=1_000_000_000_i128,
+    ) {
+        let lower = core::cmp::min(sqrt_a, sqrt_b);
+        let upper = core::cmp::max(sqrt_a, sqrt_b);
+        let liq = if lower == upper {
+            0
+        } else if sqrt_current <= lower {
+            math::get_liquidity_for_amount0(lower, upper, amount0)
+        } else if sqrt_current >= upper {
+            math::get_liquidity_for_amount1(lower, upper, amount1)
+        } else {
+            let liq0 = math::get_liquidity_for_amount0(sqrt_current, upper, amount0);
+            let liq1 = math::get_liquidity_for_amount1(lower, sqrt_current, amount1);
+            core::cmp::min(liq0, liq1)
+        };
+        prop_assert!(liq >= 0);
+    }
+
+    #[test]
+    fn prop_math_amounts_for_liquidity(
+        sqrt_a in math::MIN_SQRT_PRICE..=math::MAX_SQRT_PRICE,
+        sqrt_b in math::MIN_SQRT_PRICE..=math::MAX_SQRT_PRICE,
+        sqrt_current in math::MIN_SQRT_PRICE..=math::MAX_SQRT_PRICE,
+        liquidity in -10_000_000_i128..=10_000_000_i128,
+    ) {
+        let lower = core::cmp::min(sqrt_a, sqrt_b);
+        let upper = core::cmp::max(sqrt_a, sqrt_b);
+        let (a0, a1) = if lower == upper {
+            (0, 0)
+        } else if sqrt_current <= lower {
+            (math::get_amount0_delta(lower, upper, liquidity), 0)
+        } else if sqrt_current >= upper {
+            (0, math::get_amount1_delta(lower, upper, liquidity))
+        } else {
+            (
+                math::get_amount0_delta(sqrt_current, upper, liquidity),
+                math::get_amount1_delta(lower, sqrt_current, liquidity),
+            )
+        };
+        if liquidity > 0 {
+            prop_assert!(a0 >= 0 && a1 >= 0);
+        } else {
+            prop_assert!(a0 <= 0 && a1 <= 0);
+        }
+    }
 }
 
 /// Exhaustive full-tick-range sweep.
@@ -740,14 +606,16 @@ proptest! {
 
 #[cfg(feature = "cl")]
 mod stateful {
-    use super::*;
+    use std::collections::HashMap;
+
     use proptest::test_runner::TestCaseError;
     use soroban_sdk::{
         testutils::Address as _,
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Address, BytesN, Env,
     };
-    use std::collections::HashMap;
+
+    use super::*;
 
     mod cl_wasm {
         soroban_sdk::contractimport!(
@@ -797,6 +665,8 @@ mod stateful {
         swap_out_b: i128,
         collected_a: i128,
         collected_b: i128,
+        protocol_fees_a: i128,
+        protocol_fees_b: i128,
     }
 
     impl Ctx {
@@ -1043,6 +913,302 @@ mod stateful {
             }
             true
         }
+
+        fn swap_exact_out(&mut self, zero_for_one: bool, amount_out: i128) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let max_in = amount_out.saturating_mul(20).max(1_000_000);
+            if zero_for_one {
+                StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &max_in);
+            } else {
+                StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &max_in);
+            }
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let limit = if zero_for_one {
+                math::MIN_SQRT_PRICE + 1
+            } else {
+                math::MAX_SQRT_PRICE - 1
+            };
+            let res = client.try_swap_exact_out(
+                &self.provider,
+                &zero_for_one,
+                &amount_out,
+                &limit,
+                &max_in,
+                &u64::MAX,
+            );
+            let Ok(Ok(_)) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            if zero_for_one {
+                self.swap_in_a += (ba1 - ba0).max(0);
+                self.swap_out_b += (bb0 - bb1).max(0);
+            } else {
+                self.swap_in_b += (bb1 - bb0).max(0);
+                self.swap_out_a += (ba0 - ba1).max(0);
+            }
+            true
+        }
+
+        fn modify_pos(&mut self, idx: usize, delta: i128, spacing: i32, p1: i32, p2: i32) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let (lower, upper) = if self.positions.is_empty() || idx >= self.positions.len() {
+                let lo = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
+                let hi = align(p1.max(p2), spacing).clamp(lo + spacing, MAX_TICK);
+                if lo >= hi {
+                    return false;
+                }
+                (lo, hi)
+            } else {
+                (self.positions[idx].lower, self.positions[idx].upper)
+            };
+
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let res = client.try_modify_position(
+                &self.provider,
+                &lower,
+                &upper,
+                &delta,
+                &0,
+                &0,
+                &u64::MAX,
+            );
+            let Ok(Ok((aa, ab))) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            if delta > 0 {
+                self.minted_a += (ba1 - ba0).max(0);
+                self.minted_b += (bb1 - bb0).max(0);
+                for tick in [lower, upper] {
+                    *self.gross.entry(tick).or_insert(0) += delta;
+                }
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
+                    self.positions.push(LivePos { lower, upper });
+                }
+            } else {
+                self.burned_a += (ba0 - ba1).max(0);
+                self.burned_b += (bb0 - bb1).max(0);
+                let burn_abs = (-delta).min(aa.abs() + ab.abs());
+                for tick in [lower, upper] {
+                    if let Some(g) = self.gross.get_mut(&tick) {
+                        *g -= burn_abs;
+                        if *g <= 0 {
+                            self.gross.remove(&tick);
+                        }
+                    }
+                }
+            }
+            true
+        }
+
+        fn mint_single_token(
+            &mut self,
+            lower: i32,
+            upper: i32,
+            token_is_a: bool,
+            amount: i128,
+        ) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let token_in = if token_is_a {
+                self.ta.clone()
+            } else {
+                self.tb.clone()
+            };
+            if token_is_a {
+                StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &amount);
+            } else {
+                StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &amount);
+            }
+            let old_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let res = client.try_mint_position_single_token(
+                &self.provider,
+                &lower,
+                &upper,
+                &token_in,
+                &amount,
+                &0,
+                &u64::MAX,
+            );
+            let Ok(Ok(_res)) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            self.minted_a += (ba1 - ba0).max(0);
+            self.minted_b += (bb1 - bb0).max(0);
+
+            let new_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let delta = new_liq - old_liq;
+            if delta > 0 {
+                for tick in [lower, upper] {
+                    *self.gross.entry(tick).or_insert(0) += delta;
+                }
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
+                    self.positions.push(LivePos { lower, upper });
+                }
+            }
+            true
+        }
+
+        fn place_range_order(&mut self, p1: i32, p2: i32, amount: i128, spacing: i32) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let cur = self.current_tick();
+            let lower = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
+            let upper = align(p1.max(p2), spacing).clamp(lower + spacing, MAX_TICK);
+            if lower >= upper {
+                return false;
+            }
+            if cur >= lower && cur < upper {
+                return false;
+            }
+
+            let is_above = cur < lower;
+            let token_in = if is_above {
+                self.ta.clone()
+            } else {
+                self.tb.clone()
+            };
+            if is_above {
+                StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &amount);
+            } else {
+                StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &amount);
+            }
+
+            let old_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let res = client.try_place_range_order(
+                &self.provider,
+                &lower,
+                &upper,
+                &token_in,
+                &amount,
+                &0,
+                &u64::MAX,
+            );
+            let Ok(Ok(_res)) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            self.minted_a += (ba1 - ba0).max(0);
+            self.minted_b += (bb1 - bb0).max(0);
+
+            // Also call check_range_order_filled
+            let _ = client.try_check_range_order_filled(&self.provider, &lower, &upper);
+
+            let new_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let delta = new_liq - old_liq;
+            if delta > 0 {
+                for tick in [lower, upper] {
+                    *self.gross.entry(tick).or_insert(0) += delta;
+                }
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
+                    self.positions.push(LivePos { lower, upper });
+                }
+            }
+            true
+        }
+
+        fn collect_by_token_id(&mut self, idx: usize) {
+            if self.positions.is_empty() || idx >= self.positions.len() {
+                return;
+            }
+            let p = self.positions[idx].clone();
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            if let Ok(Ok(Some(token_id))) =
+                client.try_position_token_id(&self.provider, &p.lower, &p.upper)
+            {
+                if let Ok(Ok((ca, cb))) =
+                    client.try_collect_fees_by_token_id(&self.provider, &token_id)
+                {
+                    self.collected_a += ca;
+                    self.collected_b += cb;
+                }
+            }
+        }
+
+        fn burn_by_token_id(&mut self, idx: usize, amount: i128) {
+            if self.positions.is_empty() || idx >= self.positions.len() {
+                return;
+            }
+            let p = self.positions[idx].clone();
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let liq = match client.try_get_position(&self.provider, &p.lower, &p.upper) {
+                Ok(Ok(pos)) => pos.liquidity,
+                _ => 0,
+            };
+            if liq <= 0 {
+                return;
+            }
+            let burn = amount.min(liq);
+            if let Ok(Ok(Some(token_id))) =
+                client.try_position_token_id(&self.provider, &p.lower, &p.upper)
+            {
+                let Ok(Ok((ba, bb))) =
+                    client.try_burn_position_by_token_id(&self.provider, &token_id, &burn)
+                else {
+                    return;
+                };
+                self.burned_a += ba;
+                self.burned_b += bb;
+                for tick in [p.lower, p.upper] {
+                    if let Some(g) = self.gross.get_mut(&tick) {
+                        *g -= burn;
+                        if *g <= 0 {
+                            self.gross.remove(&tick);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn withdraw_protocol_fees(&mut self) {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            if client.try_withdraw_protocol_fees(&self.admin).is_ok() {
+                let (ba1, bb1) = (self.bal_a(), self.bal_b());
+                self.protocol_fees_a += (ba0 - ba1).max(0);
+                self.protocol_fees_b += (bb0 - bb1).max(0);
+            }
+        }
     }
 
     fn deploy(fee_bps: i128, initial_tick: i32, spacing: i32) -> Ctx {
@@ -1094,6 +1260,8 @@ mod stateful {
             swap_out_b: 0,
             collected_a: 0,
             collected_b: 0,
+            protocol_fees_a: 0,
+            protocol_fees_b: 0,
         }
     }
 
@@ -1129,10 +1297,12 @@ mod stateful {
         // 2. Balance conservation: the pool's token balances exactly match the
         //    algebraic sum of every transfer it has performed.
         let (ba, bb) = (ctx.bal_a(), ctx.bal_b());
-        let derived_a =
-            ctx.minted_a - ctx.burned_a - ctx.collected_a + ctx.swap_in_a - ctx.swap_out_a;
-        let derived_b =
-            ctx.minted_b - ctx.burned_b - ctx.collected_b + ctx.swap_in_b - ctx.swap_out_b;
+        let derived_a = ctx.minted_a - ctx.burned_a - ctx.collected_a - ctx.protocol_fees_a
+            + ctx.swap_in_a
+            - ctx.swap_out_a;
+        let derived_b = ctx.minted_b - ctx.burned_b - ctx.collected_b - ctx.protocol_fees_b
+            + ctx.swap_in_b
+            - ctx.swap_out_b;
         prop_assert_eq!(
             ba,
             derived_a,
@@ -1242,20 +1412,29 @@ mod stateful {
         let mut last_accrued = (0_i128, 0_i128);
         for (kind, p1, p2, amount, flag) in ops {
             step += 1;
-            let op_label = match kind {
+            let op_kind = kind % 11;
+            let op_label = match op_kind {
                 0 => "mint",
                 1 => "swap",
                 2 => "burn",
-                _ => "collect",
+                3 => "collect",
+                4 => "swap_exact_out",
+                5 => "modify_position",
+                6 => "mint_single_token",
+                7 => "place_range_order",
+                8 => "collect_by_token_id",
+                9 => "withdraw_protocol_fees",
+                10 => "burn_by_token_id",
+                _ => "op",
             };
 
-            let tick_before = if kind == 1 {
+            let tick_before = if op_kind == 1 || op_kind == 4 {
                 Some(ctx.current_tick())
             } else {
                 None
             };
 
-            match kind {
+            match op_kind {
                 0 => {
                     let lower = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
                     let upper = align(p1.max(p2), spacing).clamp(lower + spacing, MAX_TICK);
@@ -1264,16 +1443,45 @@ mod stateful {
                     }
                 }
                 1 => {
-                    ctx.swap(flag == 0, amount);
+                    ctx.swap(flag == 0, amount.abs().max(1));
                 }
                 2 => {
                     let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
-                    ctx.burn(idx, amount);
+                    ctx.burn(idx, amount.abs());
                 }
-                _ => {
+                3 => {
                     let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
                     ctx.collect(idx);
                 }
+                4 => {
+                    ctx.swap_exact_out(flag == 0, amount.abs().clamp(1, 10_000));
+                }
+                5 => {
+                    let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
+                    ctx.modify_pos(idx, amount, spacing, p1, p2);
+                }
+                6 => {
+                    let lower = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
+                    let upper = align(p1.max(p2), spacing).clamp(lower + spacing, MAX_TICK);
+                    if lower < upper {
+                        ctx.mint_single_token(lower, upper, flag == 0, amount.abs().max(1));
+                    }
+                }
+                7 => {
+                    ctx.place_range_order(p1, p2, amount.abs().max(1), spacing);
+                }
+                8 => {
+                    let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
+                    ctx.collect_by_token_id(idx);
+                }
+                9 => {
+                    ctx.withdraw_protocol_fees();
+                }
+                10 => {
+                    let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
+                    ctx.burn_by_token_id(idx, amount.abs());
+                }
+                _ => {}
             }
 
             if let Some(t0) = tick_before {
@@ -1312,10 +1520,15 @@ mod stateful {
             ops.push((1, i, 0, 50_000 + i as i128 * 7_777, (i % 2) as u8)); // swap
         }
         ops.push((0, -200, 200, 100_000, 0)); // mint
+        ops.push((4, 0, 0, 500, 0)); // swap_exact_out
+        ops.push((5, 0, -200, 10_000, 0)); // modify_position (add)
+        ops.push((6, 500, 1000, 50_000, 0)); // mint_position_single_token
+        ops.push((7, 1200, 1500, 50_000, 0)); // place_range_order & check_range_order_filled
         ops.push((2, 0, 0, 50_000, 0)); // burn
         ops.push((3, 1, 0, 0, 0)); // collect
-        ops.push((2, 2, 0, 100_000, 0)); // burn
-        ops.push((3, 0, 0, 0, 0)); // collect
+        ops.push((8, 0, 0, 0, 0)); // collect_fees_by_token_id
+        ops.push((9, 0, 0, 0, 0)); // withdraw_protocol_fees
+        ops.push((10, 2, 0, 50_000, 0)); // burn_position_by_token_id
 
         let (ctx, max_crossings) =
             run_script((30_i128, 0_i32, 1_i32, seed, ops)).expect("stateful invariants failed");
