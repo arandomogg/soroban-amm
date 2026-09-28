@@ -3203,6 +3203,8 @@ mod tests {
 
         assert_eq!(factory.get_default_fee_tier(), 1);
         assert_instance_ttl_bumped(&env, &factory_addr);
+    }
+
     // ── Issue #923: no event escapes the version stamp ────────────────────────
     //
     // Rather than one assertion per topic, this walks the whole event log for a
